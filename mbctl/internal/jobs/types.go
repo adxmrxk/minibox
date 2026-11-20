@@ -62,6 +62,7 @@ func (s Spec) Validate() error {
 // Job is one unit of work and its result.
 type Job struct {
 	ID        string    `json:"id"`
+	Owner     string    `json:"owner"`
 	Spec      Spec      `json:"spec"`
 	Status    Status    `json:"status"`
 	Agent     string    `json:"agent,omitempty"`

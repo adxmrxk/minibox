@@ -16,6 +16,7 @@ package coord
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,6 +58,9 @@ type Store struct {
 
 	mu     sync.Mutex
 	leases map[string]clientv3.LeaseID
+	// written remembers the slot and running counts last stored for each agent, so an idle
+	// agent's poll only renews its lease and does not write to etcd.
+	written map[string][2]int
 }
 
 type agentInfo struct {
@@ -65,8 +69,14 @@ type agentInfo struct {
 	LastSeen int64 `json:"last_seen"`
 }
 
-// Open connects to etcd. prefix namespaces the keys, so several stores can share one cluster.
+// Open connects to etcd without TLS. prefix namespaces the keys, so several stores can share one cluster.
 func Open(endpoints []string, prefix string) (*Store, error) {
+	return OpenTLS(endpoints, prefix, nil)
+}
+
+// OpenTLS connects to etcd. Pass a tls.Config to trust the cluster's certificate authority.
+// A nil config means plain HTTP.
+func OpenTLS(endpoints []string, prefix string, tlsCfg *tls.Config) (*Store, error) {
 	if len(endpoints) == 0 {
 		return nil, errors.New("at least one etcd endpoint is required")
 	}
@@ -76,6 +86,7 @@ func Open(endpoints []string, prefix string) (*Store, error) {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   endpoints,
 		DialTimeout: opTimeout,
+		TLS:         tlsCfg,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("connect to etcd: %w", err)
@@ -86,6 +97,7 @@ func Open(endpoints []string, prefix string) (*Store, error) {
 		Now:      time.Now,
 		LeaseTTL: DefaultLeaseTTL,
 		leases:   map[string]clientv3.LeaseID{},
+		written:  map[string][2]int{},
 	}, nil
 }
 
@@ -126,10 +138,13 @@ func ctxTimeout() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), opTimeout)
 }
 
-// Submit validates a spec and queues it.
-func (s *Store) Submit(spec jobs.Spec) (jobs.Job, error) {
+// Submit validates a spec and queues it for owner.
+func (s *Store) Submit(spec jobs.Spec, owner string) (jobs.Job, error) {
 	if err := spec.Validate(); err != nil {
 		return jobs.Job{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if strings.TrimSpace(owner) == "" {
+		return jobs.Job{}, fmt.Errorf("%w: owner is required", ErrInvalid)
 	}
 	// Retry on contention: another coordinator may take the next number first.
 	for attempt := 0; attempt < 50; attempt++ {
@@ -151,6 +166,7 @@ func (s *Store) Submit(spec jobs.Spec) (jobs.Job, error) {
 		now := s.Now()
 		job := jobs.Job{
 			ID:        jobID(next),
+			Owner:     owner,
 			Spec:      spec,
 			Status:    jobs.Queued,
 			Submitted: now,
@@ -203,6 +219,7 @@ func (s *Store) Poll(name string, slots, running int) (*jobs.Job, error) {
 func (s *Store) refreshAgent(name string, slots, running int) error {
 	s.mu.Lock()
 	id, known := s.leases[name]
+	last, wrote := s.written[name]
 	s.mu.Unlock()
 
 	ctx, cancel := ctxTimeout()
@@ -210,6 +227,9 @@ func (s *Store) refreshAgent(name string, slots, running int) error {
 	if known {
 		if _, err := s.cli.KeepAliveOnce(ctx, id); err != nil {
 			known = false
+		} else if wrote && last == [2]int{slots, running} {
+			// Nothing changed and the lease is renewed, so there is nothing to write.
+			return nil
 		}
 	}
 	if !known {
@@ -231,8 +251,13 @@ func (s *Store) refreshAgent(name string, slots, running int) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.cli.Put(ctx, s.agentKey(name), string(raw), clientv3.WithLease(id))
-	return err
+	if _, err := s.cli.Put(ctx, s.agentKey(name), string(raw), clientv3.WithLease(id)); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.written[name] = [2]int{slots, running}
+	s.mu.Unlock()
+	return nil
 }
 
 // requeueOrphans moves jobs back to the queue when the agent holding them no longer has a
@@ -414,8 +439,9 @@ func (s *Store) Get(id string) (jobs.Job, bool) {
 	return j, true
 }
 
-// List returns the most recent jobs, newest first, up to ListLimit.
-func (s *Store) List() ([]jobs.Job, error) {
+// List returns owner's jobs, newest first. It looks at the newest ListLimit jobs overall
+// and keeps the ones owner submitted.
+func (s *Store) List(owner string) ([]jobs.Job, error) {
 	ctx, cancel := ctxTimeout()
 	defer cancel()
 	resp, err := s.cli.Get(ctx, s.jobsPrefix(),
@@ -431,7 +457,9 @@ func (s *Store) List() ([]jobs.Job, error) {
 		if err := json.Unmarshal(kv.Value, &j); err != nil {
 			return nil, fmt.Errorf("corrupt job at %s: %w", kv.Key, err)
 		}
-		out = append(out, j)
+		if j.Owner == owner {
+			out = append(out, j)
+		}
 	}
 	return out, nil
 }

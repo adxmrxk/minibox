@@ -54,18 +54,18 @@ func mustMetrics(t *testing.T, s *Store) string {
 func TestSubmitRejectsJobsWithoutImage(t *testing.T) {
 	// Validation runs before anything reaches etcd, so this needs no cluster.
 	s := &Store{}
-	if _, err := s.Submit(jobs.Spec{Cmd: []string{"true"}}); err == nil {
+	if _, err := s.Submit(jobs.Spec{Cmd: []string{"true"}}, "tester"); err == nil {
 		t.Fatal("expected an error for a job with no image")
 	}
 }
 
 func TestPollAssignsOldestQueuedJobWithinSlots(t *testing.T) {
 	s := newStore(t)
-	first, err := s.Submit(spec())
+	first, err := s.Submit(spec(), "tester")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Submit(spec()); err != nil {
+	if _, err := s.Submit(spec(), "tester"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -85,7 +85,7 @@ func TestPollAssignsOldestQueuedJobWithinSlots(t *testing.T) {
 
 func TestReportOnlyAcceptsTheAssignedAgent(t *testing.T) {
 	s := newStore(t)
-	j, _ := s.Submit(spec())
+	j, _ := s.Submit(spec(), "tester")
 	s.Poll("agent-a", 1, 0)
 
 	if err := s.Report(j.ID, "agent-b", jobs.Succeeded, 0, ""); err == nil {
@@ -106,7 +106,7 @@ func TestReportOnlyAcceptsTheAssignedAgent(t *testing.T) {
 // An agent whose lease expires is treated as dead, and its job goes to another agent.
 func TestDeadAgentJobsAreRequeued(t *testing.T) {
 	s := newStore(t)
-	j, _ := s.Submit(spec())
+	j, _ := s.Submit(spec(), "tester")
 	s.Poll("agent-a", 1, 0)
 
 	// agent-a stops polling. Its lease runs out after LeaseTTL.
@@ -124,7 +124,7 @@ func TestDeadAgentJobsAreRequeued(t *testing.T) {
 // A live agent keeps its jobs, because its lease keeps getting renewed.
 func TestLiveAgentKeepsItsJob(t *testing.T) {
 	s := newStore(t)
-	j, _ := s.Submit(spec())
+	j, _ := s.Submit(spec(), "tester")
 	s.Poll("agent-a", 1, 0)
 	for i := 0; i < 3; i++ {
 		time.Sleep(s.LeaseTTL / 2)
@@ -141,7 +141,7 @@ func TestLiveAgentKeepsItsJob(t *testing.T) {
 
 func TestStateSurvivesRestart(t *testing.T) {
 	s := newStore(t)
-	j, _ := s.Submit(spec())
+	j, _ := s.Submit(spec(), "tester")
 	prefix := s.prefix
 	s.Close()
 
@@ -154,7 +154,7 @@ func TestStateSurvivesRestart(t *testing.T) {
 	if !ok || got.Status != jobs.Queued {
 		t.Fatalf("job lost across restart: %+v, %v", got, ok)
 	}
-	next, _ := reopened.Submit(spec())
+	next, _ := reopened.Submit(spec(), "tester")
 	if next.ID == j.ID {
 		t.Fatal("job IDs repeated after restart")
 	}
@@ -165,7 +165,7 @@ func TestConcurrentPollsNeverDoubleAssign(t *testing.T) {
 	s := newStore(t)
 	const total = 40
 	for i := 0; i < total; i++ {
-		if _, err := s.Submit(spec()); err != nil {
+		if _, err := s.Submit(spec(), "tester"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -207,9 +207,9 @@ func TestConcurrentPollsNeverDoubleAssign(t *testing.T) {
 
 func TestListReturnsNewestFirst(t *testing.T) {
 	s := newStore(t)
-	a, _ := s.Submit(spec())
-	b, _ := s.Submit(spec())
-	list, err := s.List()
+	a, _ := s.Submit(spec(), "tester")
+	b, _ := s.Submit(spec(), "tester")
+	list, err := s.List("tester")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,8 +220,8 @@ func TestListReturnsNewestFirst(t *testing.T) {
 
 func TestMetricsCountJobsAndAgents(t *testing.T) {
 	s := newStore(t)
-	s.Submit(spec())
-	s.Submit(spec())
+	s.Submit(spec(), "tester")
+	s.Submit(spec(), "tester")
 	s.Poll("agent-a", 4, 1)
 
 	m := mustMetrics(t, s)

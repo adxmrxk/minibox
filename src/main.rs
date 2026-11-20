@@ -6,6 +6,8 @@
 mod linux;
 #[cfg(target_os = "linux")]
 mod net;
+#[cfg(target_os = "linux")]
+mod registry;
 
 #[cfg(target_os = "linux")]
 fn main() {

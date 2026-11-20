@@ -8,6 +8,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -38,6 +40,7 @@ func main() {
 	slots := flag.Int("slots", 2, "how many jobs can run at once")
 	minibox := flag.String("minibox", "minibox", "path to the minibox binary")
 	idle := flag.Duration("interval", 2*time.Second, "how often to poll when there is nothing to do")
+	caFile := flag.String("ca", "", "PEM file with the CA or certificate that signed the coordinator's TLS cert")
 	flag.Parse()
 
 	if *token == "" {
@@ -46,8 +49,12 @@ func main() {
 	if *slots < 1 {
 		log.Fatal("mbagent: --slots must be at least 1")
 	}
+	httpClient, err := newHTTPClient(*caFile)
+	if err != nil {
+		log.Fatalf("mbagent: %v", err)
+	}
 
-	c := &client{base: strings.TrimRight(*server, "/"), token: *token, http: &http.Client{Timeout: 20 * time.Second}}
+	c := &client{base: strings.TrimRight(*server, "/"), token: *token, http: httpClient}
 	var running atomic.Int32
 	log.Printf("mbagent %s: %d slots, coordinator %s", *name, *slots, c.base)
 
@@ -69,6 +76,29 @@ func main() {
 			runJob(c, *name, *minibox, j)
 		}(job)
 	}
+}
+
+// newHTTPClient returns a client that trusts the system roots, plus the CA in caFile if given.
+func newHTTPClient(caFile string) (*http.Client, error) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read CA file: %w", err)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("CA file has no valid PEM certificates")
+		}
+		tlsCfg.RootCAs = pool
+	}
+	return &http.Client{
+		Timeout:   20 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+	}, nil
 }
 
 func runJob(c *client, name, minibox string, j *jobs.Job) {

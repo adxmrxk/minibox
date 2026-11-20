@@ -20,10 +20,13 @@ MBAGENT="${MBAGENT:-$ROOT/bin/mbagent}"
 ROOTFS="${ROOTFS:-/opt/minibox-rootfs}"
 TOKEN="etcd-$$"
 PORT=18791
-URL="http://127.0.0.1:$PORT"
+URL="https://127.0.0.1:$PORT"
 WORK="$(mktemp -d /tmp/mb-etcd.XXXXXX)"
-EP=("http://127.0.0.1:23791" "http://127.0.0.1:23792" "http://127.0.0.1:23793")
-PEER=("http://127.0.0.1:23801" "http://127.0.0.1:23802" "http://127.0.0.1:23803")
+. "$HERE/tls.sh"
+CA="$WORK/tls.crt"; KEY="$WORK/tls.key"; make_tls_cert "$WORK"
+CLIENTS="$WORK/clients.txt"; printf 'tester %s\nbob %s\n' "$(token_hash "$TOKEN")" "$(token_hash "bob-$$")" > "$CLIENTS"
+EP=("https://127.0.0.1:23791" "https://127.0.0.1:23792" "https://127.0.0.1:23793")
+PEER=("https://127.0.0.1:23801" "https://127.0.0.1:23802" "https://127.0.0.1:23803")
 EPS="$(IFS=,; echo "${EP[*]}")"
 INITIAL="m1=${PEER[0]},m2=${PEER[1]},m3=${PEER[2]}"
 ETCD_PID=("" "" "")
@@ -61,12 +64,13 @@ start_member() {
         --listen-client-urls "${EP[$i]}" --advertise-client-urls "${EP[$i]}" \
         --listen-peer-urls "${PEER[$i]}" --initial-advertise-peer-urls "${PEER[$i]}" \
         --initial-cluster "$INITIAL" --initial-cluster-token mbtest --initial-cluster-state new \
+        --cert-file "$CA" --key-file "$KEY" --peer-cert-file "$CA" --peer-key-file "$KEY" --peer-trusted-ca-file "$CA" \
         >"$WORK/etcd-m$((i + 1)).log" 2>&1 &
     ETCD_PID[$i]=$!
 }
 
 etcdctl_at() {
-    ETCDCTL_API=3 etcdctl --endpoints="$1" "${@:2}"
+    ETCDCTL_API=3 etcdctl --endpoints="$1" --cacert "$CA" "${@:2}"
 }
 
 wait_healthy() {
@@ -119,22 +123,22 @@ tar -C "$ROOTFS" -cf "$WORK/ci.tar" .
 MINIBOX_IMAGE_DIR="$WORK/images" MINIBOX_STATE_DIR="$WORK/state" "$BIN" image import ci "$WORK/ci.tar" >/dev/null
 
 AGENT_TOKEN="agent-$$"
-echo "etcd-host $AGENT_TOKEN" > "$WORK/agents.txt"
-"$MBD" --addr "127.0.0.1:$PORT" --token "$TOKEN" --agent-tokens "$WORK/agents.txt" --etcd "$EPS" --prefix "/etcd-$$" \
+echo "etcd-host $(token_hash "$AGENT_TOKEN")" > "$WORK/agents.txt"
+"$MBD" --addr "127.0.0.1:$PORT" --tls-cert "$CA" --tls-key "$KEY" --client-tokens "$CLIENTS" --agent-tokens "$WORK/agents.txt" --etcd "$EPS" --etcd-ca "$CA" --prefix "/etcd-$$" \
     >"$WORK/mbd.log" 2>&1 &
 MBD_PID=$!
 for _ in $(seq 50); do
-    curl -s -o /dev/null "$URL/metrics" && break
+    curl -s --cacert "$CA" -o /dev/null "$URL/metrics" && break
     sleep 0.1
 done
 
-MINIBOX_IMAGE_DIR="$WORK/images" MINIBOX_STATE_DIR="$WORK/state" "$MBAGENT" \
+MINIBOX_IMAGE_DIR="$WORK/images" MINIBOX_STATE_DIR="$WORK/state" "$MBAGENT" --ca "$CA" \
     --server "$URL" --token "$AGENT_TOKEN" --name etcd-host --slots 2 --minibox "$BIN" --interval 500ms \
     >"$WORK/agent.log" 2>&1 &
 AGENT_PID=$!
 
 submit() {
-    curl -s -w '\n%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    curl -s --cacert "$CA" -w '\n%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
         -d "$1" "$URL/v1/jobs" --max-time 15
 }
 
@@ -143,7 +147,7 @@ submit_id() {
 }
 
 job_status() {
-    curl -s -H "Authorization: Bearer $TOKEN" --max-time 10 "$URL/v1/jobs/$1" \
+    curl -s --cacert "$CA" -H "Authorization: Bearer $TOKEN" --max-time 10 "$URL/v1/jobs/$1" \
         | grep -o '"status": *"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/'
 }
 

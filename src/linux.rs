@@ -26,6 +26,23 @@ const TIMED_OUT: i32 = 124;
 const DEV_NODES: [&str; 5] = ["null", "zero", "random", "urandom", "tty"];
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Older system call numbers that only exist on x86_64. musl and some older binaries
+/// (Alpine's busybox among them) use them for stat, open, and friends. On other
+/// architectures this list is empty, and that architecture needs its own complete list.
+#[cfg(target_arch = "x86_64")]
+const LEGACY_SYSCALLS: &[libc::c_long] = &[
+    libc::SYS_stat, libc::SYS_lstat, libc::SYS_open, libc::SYS_access, libc::SYS_pipe,
+    libc::SYS_readlink, libc::SYS_getdents, libc::SYS_mkdir, libc::SYS_rmdir,
+    libc::SYS_unlink, libc::SYS_rename, libc::SYS_creat, libc::SYS_link, libc::SYS_symlink,
+    libc::SYS_chmod, libc::SYS_chown, libc::SYS_lchown, libc::SYS_mknod, libc::SYS_utime,
+    libc::SYS_utimes, libc::SYS_dup2, libc::SYS_select, libc::SYS_poll, libc::SYS_time,
+    libc::SYS_alarm, libc::SYS_pause, libc::SYS_getpgrp, libc::SYS_arch_prctl,
+    libc::SYS_fork, libc::SYS_vfork, libc::SYS_epoll_create, libc::SYS_eventfd,
+    libc::SYS_signalfd, libc::SYS_inotify_init, libc::SYS_epoll_wait,
+];
+#[cfg(not(target_arch = "x86_64"))]
+const LEGACY_SYSCALLS: &[libc::c_long] = &[];
+
 /// Root inside a job is this unprivileged host uid (and gid). The job's 65536 ids map to
 /// host ids 100000 to 165535, so a job's "root" has no power over the host.
 pub const BASE_ID: u32 = 100_000;
@@ -48,7 +65,7 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_fchownat, libc::SYS_fchown, libc::SYS_ftruncate, libc::SYS_fallocate,
     libc::SYS_fsync, libc::SYS_fdatasync, libc::SYS_sync_file_range, libc::SYS_syncfs,
     libc::SYS_sync, libc::SYS_getdents64, libc::SYS_getcwd, libc::SYS_chdir,
-    libc::SYS_fchdir, libc::SYS_utimensat, libc::SYS_umask, libc::SYS_dup, libc::SYS_dup2,
+    libc::SYS_fchdir, libc::SYS_utimensat, libc::SYS_umask, libc::SYS_dup,
     libc::SYS_dup3, libc::SYS_pipe2, libc::SYS_fcntl, libc::SYS_flock, libc::SYS_ioctl,
     libc::SYS_fgetxattr, libc::SYS_getxattr, libc::SYS_lgetxattr, libc::SYS_listxattr,
     libc::SYS_flistxattr, libc::SYS_llistxattr, libc::SYS_readahead, libc::SYS_splice,
@@ -63,15 +80,15 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn,
     libc::SYS_rt_sigpending, libc::SYS_rt_sigtimedwait, libc::SYS_rt_sigqueueinfo,
     libc::SYS_rt_sigsuspend, libc::SYS_sigaltstack, libc::SYS_kill, libc::SYS_tgkill,
-    libc::SYS_tkill, libc::SYS_pause, libc::SYS_signalfd4,
+    libc::SYS_tkill, libc::SYS_signalfd4,
     // processes and identity
-    libc::SYS_clone, libc::SYS_clone3, libc::SYS_fork, libc::SYS_vfork,
+    libc::SYS_clone, libc::SYS_clone3,
     libc::SYS_execve, libc::SYS_execveat, libc::SYS_exit, libc::SYS_exit_group,
     libc::SYS_wait4, libc::SYS_waitid, libc::SYS_getpid, libc::SYS_getppid,
-    libc::SYS_gettid, libc::SYS_getpgid, libc::SYS_getpgrp, libc::SYS_setpgid,
+    libc::SYS_gettid, libc::SYS_getpgid, libc::SYS_setpgid,
     libc::SYS_getsid, libc::SYS_setsid, libc::SYS_set_tid_address,
     libc::SYS_set_robust_list, libc::SYS_get_robust_list, libc::SYS_prctl,
-    libc::SYS_arch_prctl, libc::SYS_rseq, libc::SYS_getuid, libc::SYS_geteuid,
+    libc::SYS_rseq, libc::SYS_getuid, libc::SYS_geteuid,
     libc::SYS_getgid, libc::SYS_getegid, libc::SYS_setuid, libc::SYS_setgid,
     libc::SYS_setreuid, libc::SYS_setregid, libc::SYS_setresuid, libc::SYS_setresgid,
     libc::SYS_getresuid, libc::SYS_getresgid, libc::SYS_setfsuid, libc::SYS_setfsgid,
@@ -83,15 +100,15 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_getcpu, libc::SYS_futex, libc::SYS_restart_syscall,
     // time and limits
     libc::SYS_nanosleep, libc::SYS_clock_nanosleep, libc::SYS_clock_gettime,
-    libc::SYS_clock_getres, libc::SYS_gettimeofday, libc::SYS_time, libc::SYS_times,
+    libc::SYS_clock_getres, libc::SYS_gettimeofday, libc::SYS_times,
     libc::SYS_timer_create, libc::SYS_timer_settime, libc::SYS_timer_gettime,
     libc::SYS_timer_delete, libc::SYS_timerfd_create, libc::SYS_timerfd_settime,
-    libc::SYS_timerfd_gettime, libc::SYS_alarm, libc::SYS_setitimer, libc::SYS_getitimer,
+    libc::SYS_timerfd_gettime, libc::SYS_setitimer, libc::SYS_getitimer,
     libc::SYS_getrlimit, libc::SYS_setrlimit, libc::SYS_prlimit64, libc::SYS_getrusage,
     libc::SYS_sysinfo, libc::SYS_getrandom,
     // event loops
-    libc::SYS_select, libc::SYS_pselect6, libc::SYS_poll, libc::SYS_ppoll,
-    libc::SYS_epoll_create1, libc::SYS_epoll_ctl, libc::SYS_epoll_wait,
+    libc::SYS_pselect6, libc::SYS_ppoll,
+    libc::SYS_epoll_create1, libc::SYS_epoll_ctl,
     libc::SYS_epoll_pwait, libc::SYS_eventfd2,
     // sockets
     libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
@@ -119,7 +136,7 @@ pub struct Volume {
     pub read_only: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Config {
     pub mem_mb: Option<u64>,
     pub pids: Option<u64>,
@@ -269,7 +286,7 @@ fn parse_env(spec: &str) -> Result<(String, String), String> {
 
 // ---- images -------------------------------------------------------------
 
-fn image_dir() -> PathBuf {
+pub(crate) fn image_dir() -> PathBuf {
     std::env::var_os("MINIBOX_IMAGE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_IMAGE_DIR))
@@ -278,6 +295,7 @@ fn image_dir() -> PathBuf {
 fn image_cmd(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("import") if args.len() == 3 => import_image(&args[1], Path::new(&args[2])),
+        Some("pull-registry") if args.len() == 3 => crate::registry::pull(&args[1], &args[2]),
         Some("pull") if args.len() == 3 => pull_image(&args[1], &args[2], None),
         Some("pull") if args.len() == 5 && args[3] == "--sha256" => {
             pull_image(&args[1], &args[2], Some(&args[4]))
@@ -447,6 +465,10 @@ fn run(cfg: &Config) -> Result<i32, String> {
         None => cfg.rootfs.clone(),
     };
 
+    // Volumes are prepared before anything else, so a failed mount never leaves a sandbox behind.
+    let (run_cfg, volume_mounts) = resolve_volumes(cfg, id)?;
+    let _volumes = VolumeGuard(volume_mounts);
+
     if cfg.net == NetMode::Bridge {
         net::ensure_bridge()?;
     }
@@ -493,7 +515,7 @@ fn run(cfg: &Config) -> Result<i32, String> {
         ForkResult::Child => {
             drop((down_w, up_r, out_r, err_r));
             stage1(StagePlan {
-                cfg,
+                cfg: &run_cfg,
                 argv: &argv,
                 root,
                 down: down_r,
@@ -558,6 +580,74 @@ fn handshake(
     map_ids(child)?;
     writeln!(down, "mapped").map_err(|e| format!("tell sandbox ids are mapped: {e}"))?;
     Ok(())
+}
+
+/// Makes each volume usable by the job's root (BASE_ID). A folder that BASE_ID already owns
+/// is bound as it is. Any other folder gets an idmapped mount, which shows its owner as
+/// BASE_ID for that mount only. The folder's ownership on the host does not change.
+/// Idmapped mounts need util-linux 2.39 or newer and Linux 5.12 or newer.
+fn resolve_volumes(cfg: &Config, id: u32) -> Result<(Config, Vec<PathBuf>), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut out = cfg.clone();
+    let mut mounted: Vec<PathBuf> = Vec::new();
+    let result = (|| -> Result<(), String> {
+        for (i, v) in cfg.volumes.iter().enumerate() {
+            let owner = fs::metadata(&v.host)
+                .map_err(|e| format!("stat {}: {e}", v.host.display()))?
+                .uid();
+            if owner == BASE_ID {
+                continue;
+            }
+            let target = state_dir().join(format!("run-{id}")).join(format!("vol-{i}"));
+            fs::create_dir_all(&target).map_err(|e| format!("create {}: {e}", target.display()))?;
+            mounted.push(target.clone());
+            let status = Command::new("mount")
+                .arg("--bind")
+                .arg("-o")
+                .arg(format!("X-mount.idmap=b:{owner}:{BASE_ID}:1"))
+                .arg(&v.host)
+                .arg(&target)
+                .output()
+                .map_err(|e| format!("run mount: {e}"))?;
+            if !status.status.success() {
+                return Err(format!(
+                    "cannot give the job access to {} (owned by uid {owner}). Idmapped mounts need util-linux 2.39+ and Linux 5.12+: {}",
+                    v.host.display(),
+                    String::from_utf8_lossy(&status.stderr).trim()
+                ));
+            }
+            out.volumes[i].host = target;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok((out, mounted)),
+        Err(e) => {
+            unmount_and_remove(&mounted);
+            Err(e)
+        }
+    }
+}
+
+/// Unmounts volume mounts made for a run and removes their mount points.
+struct VolumeGuard(Vec<PathBuf>);
+
+impl Drop for VolumeGuard {
+    fn drop(&mut self) {
+        unmount_and_remove(&self.0);
+    }
+}
+
+fn unmount_and_remove(paths: &[PathBuf]) {
+    for p in paths.iter().rev() {
+        let _ = umount2(p.as_path(), MntFlags::MNT_DETACH);
+        let _ = fs::remove_dir(p);
+    }
+    // The run directory that held the mount points goes too, once it is empty.
+    if let Some(parent) = paths.first().and_then(|p| p.parent()) {
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 /// Hands a path to the job's root (BASE_ID) so the job can write to it.
@@ -1212,7 +1302,9 @@ fn enter_rootfs(root: &Path, cfg: &Config) -> Result<(), String> {
     .map_err(|e| format!("bind rootfs: {e}"))?;
 
     // A few safe device nodes, bind-mounted from the host.
+    // Minimal images may not ship /dev at all, so create the mount point.
     let dev = root.join("dev");
+    fs::create_dir_all(&dev).map_err(|e| format!("create {}: {e}", dev.display()))?;
     for node in DEV_NODES {
         let target = dev.join(node);
         File::create(&target).map_err(|e| format!("create {}: {e}", target.display()))?;
@@ -1344,7 +1436,7 @@ fn harden() -> Result<(), String> {
     }
 
     let mut rules = std::collections::BTreeMap::new();
-    for nr in ALLOWED_SYSCALLS {
+    for nr in ALLOWED_SYSCALLS.iter().chain(LEGACY_SYSCALLS.iter()) {
         // An empty rule list matches the syscall for any arguments.
         rules.insert(*nr as i64, Vec::new());
     }

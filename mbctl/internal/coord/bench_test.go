@@ -26,7 +26,7 @@ func BenchmarkSubmitAndClaim(b *testing.B) {
 	sp := jobs.Spec{Image: "ci", Cmd: []string{"true"}}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := s.Submit(sp); err != nil {
+		if _, err := s.Submit(sp, "bench"); err != nil {
 			b.Fatal(err)
 		}
 		job, err := s.Poll("bench-agent", 1, 0)

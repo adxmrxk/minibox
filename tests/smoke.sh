@@ -198,6 +198,25 @@ if [ -x "$ROOTFS/bin/sh" ]; then
 fi
 rm -rf "$vol"
 
+# A folder owned by an ordinary host user is still writable by the job's root, and it stays
+# owned by that user afterwards.
+vol2=$(mktemp -d /tmp/mb-vol2.XXXXXX)
+chmod 755 "$vol2"
+chown 1000:1000 "$vol2"
+echo "from-owner" > "$vol2/owner.txt"
+chown 1000:1000 "$vol2/owner.txt"
+if [ -x "$ROOTFS/bin/sh" ]; then
+    out=$("$BIN" run --rootfs "$ROOTFS" -v "$vol2:/data" -- sh -c 'cat /data/owner.txt && echo job > /data/job.txt && echo done')
+    report "volume: a folder owned by uid 1000 is readable and writable by the job (got '$(echo $out | tr '\n' ' ')')" \
+        "$([ "$out" = "$(printf 'from-owner\ndone')" ] && [ -f "$vol2/job.txt" ] && echo yes || echo no)"
+    owner=$(stat -c %u "$vol2")
+    report "volume: the host folder keeps its owner after the job (uid $owner)" "$([ "$owner" = "1000" ] && echo yes || echo no)"
+    jobfile_owner=$(stat -c %u "$vol2/job.txt" 2>/dev/null)
+    report "volume: files the job creates belong to the folder's owner on the host (uid $jobfile_owner)" \
+        "$([ "$jobfile_owner" = "1000" ] && echo yes || echo no)"
+fi
+rm -rf "$vol2"
+
 out=$("$BIN" run -e GREETING=hello -- sh -c 'echo $GREETING')
 report "env: -e variables are set in the sandbox (got $out)" "$([ "$out" = "hello" ] && echo yes || echo no)"
 
