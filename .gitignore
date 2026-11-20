@@ -4,6 +4,9 @@ target/
 # Go binaries built by the scripts
 bin/
 
+# Private notes, not for GitHub
+KNOWN-LIMITS.txt
+
 # Editor and OS files
 .vscode/
 .idea/

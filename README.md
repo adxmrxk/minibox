@@ -166,23 +166,8 @@ API: `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, `POST /v1/agents/poll
 | `tests/etcd-cluster.sh` | Three TLS etcd members: leader loss, quorum loss (503), recovery, durability |
 | `tests/private-registry.sh` | Pulls from a local HTTPS registry that needs a login, refuses bad credentials, and rejects a corrupted layer |
 | `tests/bench.sh` | Startup overhead per job |
+| `tests/load.sh` | Simulated agents driving one coordinator: throughput, latency, and coordinator CPU at 10, 50, and 100 agents |
 
 All scripts run as root in Linux or WSL2. The multi-host test simulates a second machine.
 The etcd test runs all members on one computer.
 
-## Limits
-
-- Registry logins use HTTP Basic credentials sent to the registry's token endpoint, set with
-  `MINIBOX_REGISTRY_USER` and `MINIBOX_REGISTRY_PASSWORD`. Registries with other login
-  schemes are not supported.
-- Idmapped volume mounts need kernel 5.12+ and util-linux 2.39+. Volumes already owned by
-  uid 100000 work everywhere.
-- The seccomp allow-list was written for x86_64. The runner compiles for aarch64, but the
-  ARM build has not been run, so it is untested there.
-- Each job submit, claim, and report is one durable etcd write, so throughput is tens of
-  job cycles per second. Idle agents no longer write on every poll.
-- Tokens are stored as SHA-256 hashes, so a leaked token file does not reveal the tokens.
-  Rotate by adding the new hash, sending SIGHUP, removing the old hash, and sending SIGHUP
-  again. Tokens are not expired automatically.
-- Tested on one computer, with simulated hosts and a Windows and WSL pair. The guide in
-  `docs/multi-machine.md` has not been run on separate physical machines yet.
