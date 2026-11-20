@@ -13,6 +13,8 @@ func TestSpecValidation(t *testing.T) {
 		{Image: "ci", Cmd: []string{"true"}, Net: "vlan"},         // unknown network mode
 		{Image: "ci", Cmd: []string{"true"}, MemMB: -1},           // negative limit
 		{Image: "ci", Cmd: []string{"true"}, Workdir: "relative"}, // relative workdir
+		{Image: "../../etc", Cmd: []string{"true"}},               // path traversal in the image name
+		{Image: "a,b", Cmd: []string{"true"}},                     // comma breaks the overlay options
 	}
 	for i, s := range bad {
 		if s.Validate() == nil {

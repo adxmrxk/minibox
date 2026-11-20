@@ -3,6 +3,7 @@ package jobs
 
 import (
 	"errors"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -36,11 +37,18 @@ type Spec struct {
 	Workdir     string            `json:"workdir,omitempty"`
 }
 
+// imageName matches the names minibox accepts. The runner checks the same rule, so a bad name
+// is refused at submit time and never reaches an agent.
+var imageName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
 // Validate rejects specs that would not run safely or at all.
 func (s Spec) Validate() error {
 	if strings.TrimSpace(s.Image) == "" {
 		// Without an image the job would share the host filesystem.
 		return errors.New("image is required")
+	}
+	if !imageName.MatchString(s.Image) {
+		return errors.New("image name may only use letters, digits, '.', '_' and '-'")
 	}
 	if len(s.Cmd) == 0 {
 		return errors.New("cmd is required")

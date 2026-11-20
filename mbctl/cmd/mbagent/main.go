@@ -66,7 +66,7 @@ func main() {
 			continue
 		}
 		if job == nil {
-			time.Sleep(*idle)
+			// The coordinator already held this poll open, so poll again straight away.
 			continue
 		}
 		running.Add(1)
@@ -96,7 +96,8 @@ func newHTTPClient(caFile string) (*http.Client, error) {
 		tlsCfg.RootCAs = pool
 	}
 	return &http.Client{
-		Timeout:   20 * time.Second,
+		// Longer than the coordinator's poll hold (20s), so an idle poll is not cut off.
+		Timeout:   35 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: tlsCfg},
 	}, nil
 }
@@ -125,12 +126,44 @@ func runJob(c *client, name, minibox string, j *jobs.Job) {
 	case exitTimedOut:
 		status = jobs.TimedOut
 	}
-	if err := c.report(j.ID, name, status, code, out.String()); err != nil {
+	if err := reportWithRetry(c, j.ID, name, status, code, out.String()); err != nil {
 		log.Printf("report %s: %v", j.ID, err)
 		return
 	}
 	log.Printf("finished %s: %s (exit %d)", j.ID, status, code)
 }
+
+// reportWithRetry sends a job's result, retrying with backoff while the coordinator is
+// unreachable or failing with a 5xx. A job that is never reported stays assigned forever, so
+// losing a result is worse than a short wait. A 4xx is final: retrying it cannot succeed.
+func reportWithRetry(c *client, id, name string, status jobs.Status, code int, log string) error {
+	const attempts = 8
+	delay := 200 * time.Millisecond
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = c.report(id, name, status, code, log)
+		if err == nil {
+			return nil
+		}
+		var he *httpError
+		if errors.As(err, &he) && he.code < 500 {
+			return err
+		}
+		time.Sleep(delay)
+		if delay < 5*time.Second {
+			delay *= 2
+		}
+	}
+	return fmt.Errorf("gave up after %d attempts: %w", attempts, err)
+}
+
+// httpError is a non-2xx answer from the coordinator.
+type httpError struct {
+	code int
+	msg  string
+}
+
+func (e *httpError) Error() string { return e.msg }
 
 // buildArgs turns a job spec into `minibox run` arguments.
 func buildArgs(s jobs.Spec) []string {
@@ -210,7 +243,10 @@ func (c *client) do(method, path string, body any, out any) (int, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNoContent {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return resp.StatusCode, fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg)))
+		return resp.StatusCode, &httpError{
+			code: resp.StatusCode,
+			msg:  fmt.Sprintf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg))),
+		}
 	}
 	if out != nil && resp.StatusCode == http.StatusOK {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {

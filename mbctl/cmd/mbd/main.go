@@ -24,11 +24,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof on DefaultServeMux, served only with --pprof
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"mbctl/internal/coord"
 	"mbctl/internal/jobs"
@@ -49,7 +52,15 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "TLS private key file (PEM)")
 	insecure := flag.Bool("insecure-http", false, "serve plain HTTP. For local testing only; tokens are sent unencrypted")
 	etcdCA := flag.String("etcd-ca", "", "CA file (PEM) for etcd's TLS certificate. Set it when the etcd endpoints are https")
+	pprofAddr := flag.String("pprof", "", "optional address for Go profiling endpoints, e.g. 127.0.0.1:6060. Off by default")
 	flag.Parse()
+
+	if *pprofAddr != "" {
+		go func() {
+			log.Printf("mbd profiling endpoints on %s", *pprofAddr)
+			log.Print(http.ListenAndServe(*pprofAddr, http.DefaultServeMux))
+		}()
+	}
 
 	if (*tlsCert == "") != (*tlsKey == "") {
 		log.Fatal("mbd: --tls-cert and --tls-key must be given together")
@@ -133,6 +144,10 @@ func tokenHash() {
 	fmt.Println(hex.EncodeToString(sum[:]))
 }
 
+// validName is the set of names a user or agent may have. Names become etcd key segments, so
+// they must not contain '/'.
+var validName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
 // loadTokens reads "name hash" lines into a map from hash to name. Blank lines and lines
 // starting with # are skipped. A raw token in place of a hash is rejected.
 func loadTokens(path, kind string) (map[string]string, error) {
@@ -152,6 +167,9 @@ func loadTokens(path, kind string) (map[string]string, error) {
 		fields := strings.Fields(line)
 		if len(fields) != 2 {
 			return nil, fmt.Errorf("%s tokens line %d: want 'name sha256'", kind, i+1)
+		}
+		if !validName.MatchString(fields[0]) {
+			return nil, fmt.Errorf("%s tokens line %d: name may only use letters, digits, '.', '_' and '-'", kind, i+1)
 		}
 		if len(fields[1]) != 64 {
 			return nil, fmt.Errorf("%s tokens line %d: store the SHA-256 of the token, not the token (run: mbd token-hash)", kind, i+1)
@@ -304,7 +322,7 @@ func (s *server) pollHandler(a *auth) http.HandlerFunc {
 			writeError(w, http.StatusForbidden, "this token does not belong to that agent")
 			return
 		}
-		job, err := s.store.Poll(req.Name, req.Slots, req.Running)
+		job, err := s.store.PollWait(req.Name, req.Slots, req.Running, pollWait)
 		if err != nil {
 			writeStoreError(w, err)
 			return
@@ -316,6 +334,10 @@ func (s *server) pollHandler(a *auth) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, job)
 	}
 }
+
+// pollWait is how long an agent's poll is held open waiting for work. It must stay below the
+// agents' HTTP timeout.
+const pollWait = 20 * time.Second
 
 type reportRequest struct {
 	Agent    string `json:"agent"`
