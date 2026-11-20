@@ -35,7 +35,9 @@ RUN="r$$"
 USER_TOKEN="load-user-$RUN"
 printf 'load %s\n' "$(token_hash "$USER_TOKEN")" > "$WORK/clients.txt"
 : > "$WORK/agents.txt"
-for i in $(seq -w 1 "$MAX"); do
+# Names are three digits (001, 002, ...) to match what cmd/mbload derives, whatever the max.
+for n in $(seq 1 "$MAX"); do
+    i=$(printf '%03d' "$n")
     printf 'load-%s-%s %s\n' "$RUN" "$i" "$(token_hash "agent-$RUN-$i")" >> "$WORK/agents.txt"
 done
 

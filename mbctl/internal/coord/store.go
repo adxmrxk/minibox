@@ -69,6 +69,14 @@ type Store struct {
 	nextID   int64
 	blockEnd int64
 
+	// Long-poll wakeups, see PollWait.
+	wmu       sync.Mutex
+	waiters   []chan struct{}
+	watchMu   sync.Mutex
+	watching  bool
+	done      chan struct{}
+	closeOnce sync.Once
+
 	// requeueAt is when orphans were last checked. The check is rate-limited (see requeueOrphans).
 	requeueMu sync.Mutex
 	requeueAt time.Time
@@ -118,6 +126,7 @@ func OpenTLS(endpoints []string, prefix string, tlsCfg *tls.Config) (*Store, err
 		LeaseTTL:  DefaultLeaseTTL,
 		leases:    map[string]clientv3.LeaseID{},
 		renewedAt: map[string]time.Time{},
+		done:      make(chan struct{}),
 		written:   map[string][2]int{},
 	}
 	if err := s.backfillOwnerIndex(); err != nil {
@@ -128,7 +137,10 @@ func OpenTLS(endpoints []string, prefix string, tlsCfg *tls.Config) (*Store, err
 }
 
 // Close releases the connection.
-func (s *Store) Close() error { return s.cli.Close() }
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() { close(s.done) })
+	return s.cli.Close()
+}
 
 func (s *Store) seqKey() string            { return s.prefix + "/seq" }
 func (s *Store) jobsPrefix() string        { return s.prefix + "/jobs/" }
@@ -282,13 +294,18 @@ func (s *Store) Poll(name string, slots, running int) (*jobs.Job, error) {
 	return s.claimOldest(name)
 }
 
-// PollWait is Poll with long polling. If no job can be handed out, it waits up to wait for a
-// job to be queued, using an etcd watch, instead of making the agent poll again and again.
-// An agent with no free slot is not given work, so it only waits and returns nothing.
+// PollWait is Poll with long polling. If no job can be handed out, the agent waits up to wait
+// for one. Waiting agents are woken one at a time: each new queue entry wakes a single waiter,
+// which claims the job. The rest stay asleep instead of all racing for the same job.
 func (s *Store) PollWait(name string, slots, running int, wait time.Duration) (*jobs.Job, error) {
 	deadline := time.Now().Add(wait)
 	for {
 		if running >= slots {
+			// Nothing can be claimed, but the agent is still alive. Renew its lease, or a busy
+			// agent running a long job would look dead and its job would be requeued.
+			if err := s.refreshAgent(name, slots, running); err != nil {
+				return nil, err
+			}
 			// Nothing can be claimed, so just hold the agent for a while.
 			left := time.Until(deadline)
 			if left > 0 {
@@ -296,31 +313,141 @@ func (s *Store) PollWait(name string, slots, running int, wait time.Duration) (*
 			}
 			return nil, nil
 		}
-		// Read the queue's revision first. Any job queued after it wakes the watch below.
-		ctx, cancel := ctxTimeout()
-		resp, err := s.cli.Get(ctx, s.queuePrefix(), clientv3.WithPrefix(), clientv3.WithCountOnly())
-		cancel()
-		if err != nil {
+		if err := s.ensureWatch(); err != nil {
 			return nil, err
 		}
-		rev := resp.Header.Revision
+		// Join the waiters before looking for work, so a job queued in between still wakes us.
+		ch := s.enlist()
 		job, err := s.Poll(name, slots, running)
 		if err != nil || job != nil {
+			s.delist(ch)
+			if job != nil {
+				// More jobs may be queued. Pass the wakeup on to another waiter.
+				s.wakeOne()
+			}
 			return job, err
 		}
 		left := time.Until(deadline)
 		if left <= 0 {
+			s.delist(ch)
 			return nil, nil
 		}
-		wctx, wcancel := context.WithTimeout(context.Background(), left)
-		events := s.cli.Watch(clientv3.WithRequireLeader(wctx), s.queuePrefix(),
-			clientv3.WithPrefix(), clientv3.WithRev(rev+1))
+		// Wake at least every quarter of the lease TTL. Waiting alone does not renew the agent's
+		// lease, so an idle waiter would otherwise look dead and its jobs could be requeued.
+		tick := time.NewTimer(min(left, s.LeaseTTL/4))
 		select {
-		case <-events:
-		case <-wctx.Done():
+		case <-ch:
+		case <-tick.C:
 		}
-		wcancel()
+		tick.Stop()
+		s.delist(ch)
 	}
+}
+
+// ensureWatch starts the single etcd watch that turns queue changes into wakeups. It starts
+// from the revision read here, so no queue change is missed between the read and the watch.
+func (s *Store) ensureWatch() error {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	if s.watching {
+		return nil
+	}
+	ctx, cancel := ctxTimeout()
+	resp, err := s.cli.Get(ctx, s.queuePrefix(), clientv3.WithPrefix(), clientv3.WithCountOnly())
+	cancel()
+	if err != nil {
+		return err
+	}
+	s.watching = true
+	go s.watchQueue(resp.Header.Revision + 1)
+	return nil
+}
+
+// watchQueue wakes one waiter for every queue entry it sees. If the watch breaks, it wakes all
+// waiters, so none sleeps through a change it could not see, and then starts the watch again.
+func (s *Store) watchQueue(from int64) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-s.done
+		cancel()
+	}()
+	for {
+		events := s.cli.Watch(clientv3.WithRequireLeader(ctx), s.queuePrefix(),
+			clientv3.WithPrefix(), clientv3.WithRev(from))
+		for resp := range events {
+			if resp.Err() != nil || resp.Canceled {
+				break
+			}
+			for _, ev := range resp.Events {
+				if ev.Type == clientv3.EventTypePut {
+					s.wakeOne()
+				}
+			}
+			from = resp.Header.Revision + 1
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		s.wakeAll()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (s *Store) enlist() chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.wmu.Lock()
+	s.waiters = append(s.waiters, ch)
+	s.wmu.Unlock()
+	return ch
+}
+
+// delist removes a waiter. If it had been woken but is leaving without using the wakeup, the
+// wakeup goes to another waiter, so a queued job is never left with every waiter asleep.
+func (s *Store) delist(ch chan struct{}) {
+	s.wmu.Lock()
+	for i, w := range s.waiters {
+		if w == ch {
+			s.waiters = append(s.waiters[:i], s.waiters[i+1:]...)
+			break
+		}
+	}
+	s.wmu.Unlock()
+	select {
+	case <-ch:
+		s.wakeOne()
+	default:
+	}
+}
+
+func (s *Store) wakeOne() {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	if len(s.waiters) == 0 {
+		return
+	}
+	ch := s.waiters[0]
+	s.waiters = s.waiters[1:]
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Store) wakeAll() {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	for _, ch := range s.waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	s.waiters = nil
 }
 
 // refreshAgent writes the agent's record under its lease, creating the lease on first use
