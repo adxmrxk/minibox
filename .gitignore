@@ -1,0 +1,11 @@
+# Rust build output
+target/
+
+# Go binaries built by the scripts
+bin/
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
