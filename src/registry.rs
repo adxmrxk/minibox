@@ -61,7 +61,7 @@ fn parse_reference(input: &str) -> Result<Reference, String> {
 
 /// Pulls `reference` from its registry and stores it as image `name`.
 pub fn pull(name: &str, reference: &str) -> Result<(), String> {
-    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+    if !crate::linux::valid_image_name(name) {
         return Err(format!("bad image name '{name}'"));
     }
     let dest = image_dir().join(name);
@@ -333,14 +333,18 @@ fn apply_layer(layer: &Path, staging: &Path) -> Result<(), String> {
         };
         if base == ".wh..wh..opq" {
             // Opaque whiteout: the directory's lower contents are hidden.
-            if let Ok(entries) = fs::read_dir(staging.join(dir)) {
-                for e in entries.flatten() {
-                    let _ = remove_path(&e.path());
+            if let Some(d) = contained_path(staging, dir) {
+                if let Ok(entries) = fs::read_dir(&d) {
+                    for e in entries.flatten() {
+                        let _ = remove_path(&e.path());
+                    }
                 }
             }
         } else if let Some(original) = base.strip_prefix(".wh.") {
             // Whiteout: delete the file or directory it names.
-            let _ = remove_path(&staging.join(dir).join(original));
+            if let Some(target) = contained_path(staging, &format!("{dir}/{original}")) {
+                let _ = remove_path(&target);
+            }
         }
     }
 
@@ -356,6 +360,26 @@ fn apply_layer(layer: &Path, staging: &Path) -> Result<(), String> {
         return Err("failed to extract a layer".into());
     }
     Ok(())
+}
+
+/// Joins `rel` onto `base` and returns the path only if no existing component of it is a
+/// symlink. A layer can create symlinks to host directories, so a whiteout must never follow
+/// one. Returns None when the path would leave the image or pass through a symlink.
+fn contained_path(base: &Path, rel: &str) -> Option<PathBuf> {
+    let mut cur = base.to_path_buf();
+    for comp in rel.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        if comp == ".." {
+            return None;
+        }
+        cur.push(comp);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Ok(_) => {}
+            // Nothing exists below this point, so there is nothing to delete.
+            Err(_) => break,
+        }
+    }
+    Some(cur)
 }
 
 fn remove_path(path: &PathBuf) -> io::Result<()> {
@@ -395,6 +419,38 @@ mod tests {
         let l = parse_reference("localhost:5000/team/tool").unwrap();
         assert_eq!(l.registry, "localhost:5000");
         assert_eq!(l.tag, "latest");
+    }
+
+    /// A layer may create a symlink to a host directory. A later whiteout that names a file
+    /// under that symlink must not delete anything outside the image.
+    #[test]
+    fn whiteouts_never_touch_files_outside_the_image() {
+        let base = std::env::temp_dir().join(format!("mb-wh-test-{}", unique()));
+        let outside = base.join("host");
+        let staging = base.join("image");
+        let layer_dir = base.join("layer");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(layer_dir.join("x")).unwrap();
+        fs::write(outside.join("planted.txt"), b"host file").unwrap();
+        std::os::unix::fs::symlink(&outside, staging.join("x")).unwrap();
+        fs::write(layer_dir.join("x/.wh.planted.txt"), b"").unwrap();
+
+        let layer = base.join("layer.tar");
+        let status = Command::new("tar")
+            .arg("-cf")
+            .arg(&layer)
+            .arg("-C")
+            .arg(&layer_dir)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let _ = apply_layer(&layer, &staging);
+        let survived = outside.join("planted.txt").exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(survived, "a whiteout deleted a file outside the image");
     }
 
     #[test]

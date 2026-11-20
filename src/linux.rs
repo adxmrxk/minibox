@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -286,6 +287,16 @@ fn parse_env(spec: &str) -> Result<(String, String), String> {
 
 // ---- images -------------------------------------------------------------
 
+/// Image names become directory names, so each must be one plain path component. Anything with
+/// a slash or a leading dot, such as "../../", is refused before it can point outside the store.
+pub(crate) fn valid_image_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 128
+        && b[0].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'.' || *c == b'_' || *c == b'-')
+}
+
 pub(crate) fn image_dir() -> PathBuf {
     std::env::var_os("MINIBOX_IMAGE_DIR")
         .map(PathBuf::from)
@@ -318,7 +329,7 @@ fn image_cmd(args: &[String]) -> i32 {
 /// Unpacks a root filesystem tarball into the image store under NAME. Every file is
 /// owned by the job's root (BASE_ID), so jobs can write to the image's own layer.
 fn import_image(name: &str, tarball: &Path) -> Result<(), String> {
-    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+    if !valid_image_name(name) {
         return Err(format!("bad image name '{name}'"));
     }
     if !tarball.is_file() {
@@ -416,6 +427,11 @@ fn list_images() -> Result<(), String> {
 /// Starts a job. The runner stays outside the job's namespaces and does the host-side
 /// work: cgroups, veth pairs, state records, and collecting output.
 fn run(cfg: &Config) -> Result<i32, String> {
+    if let Some(name) = &cfg.image {
+        if !valid_image_name(name) {
+            return Err(format!("bad image name '{name}': use letters, digits, '.', '_' and '-'"));
+        }
+    }
     // Build every C string before fork so the child does no allocation.
     let argv: Vec<CString> = cfg
         .cmd
@@ -702,9 +718,11 @@ struct OutPipe {
 
 impl OutputPump {
     fn new(out_r: OwnedFd, err_r: OwnedFd, log_path: &Path) -> Result<Self, String> {
+        // Job output can hold secrets, so only the owner may read the log.
         let log = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(log_path)
             .map_err(|e| format!("open log {}: {e}", log_path.display()))?;
         Ok(OutputPump {
@@ -914,7 +932,16 @@ impl StateFile {
         };
         let dir = state_dir();
         let path = dir.join(format!("{}.json", self.id));
-        if let Err(e) = fs::create_dir_all(&dir).and_then(|_| fs::write(&path, body)) {
+        let write = || -> io::Result<()> {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?;
+            f.write_all(body.as_bytes())
+        };
+        if let Err(e) = fs::create_dir_all(&dir).and_then(|_| write()) {
             eprintln!("minibox: warning: could not write {}: {e}", path.display());
         }
     }
@@ -1465,6 +1492,18 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn image_names_are_single_plain_components() {
+        assert!(valid_image_name("alpine"));
+        assert!(valid_image_name("ci-base.v2_x"));
+        assert!(!valid_image_name("../../etc"));
+        assert!(!valid_image_name("a/b"));
+        assert!(!valid_image_name(".hidden"));
+        assert!(!valid_image_name(""));
+        assert!(!valid_image_name("with space"));
+        assert!(!valid_image_name(&"x".repeat(129)));
     }
 
     #[test]
