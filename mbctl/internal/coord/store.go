@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -36,6 +37,14 @@ const DefaultLeaseTTL = 45 * time.Second
 
 // requeueEvery is how often orphaned jobs are checked for, see requeueOrphans.
 const requeueEvery = 2 * time.Second
+
+// Counters for the /metrics endpoint, so the write load of a run can be measured.
+var (
+	ctrPolls      atomic.Int64 // PollWait calls
+	ctrKeepAlive  atomic.Int64 // lease keep-alive requests
+	ctrUpdateTxn  atomic.Int64 // job update transactions sent (claim, report, requeue)
+	ctrUpdateFail atomic.Int64 // job update transactions that lost a race
+)
 
 // MaxLogBytes caps the output kept for one job. The newest bytes are kept. etcd refuses
 // values much larger than this, so an oversized log must not block a job's result.
@@ -78,6 +87,10 @@ type Store struct {
 	closeOnce sync.Once
 
 	// requeueAt is when orphans were last checked. The check is rate-limited (see requeueOrphans).
+	// claimMu makes claims one at a time within this coordinator. Without it, every waiting agent
+	// reads the same queue head and all but one of their transactions fail, each one still a
+	// write to etcd.
+	claimMu   sync.Mutex
 	requeueMu sync.Mutex
 	requeueAt time.Time
 
@@ -298,6 +311,7 @@ func (s *Store) Poll(name string, slots, running int) (*jobs.Job, error) {
 // for one. Waiting agents are woken one at a time: each new queue entry wakes a single waiter,
 // which claims the job. The rest stay asleep instead of all racing for the same job.
 func (s *Store) PollWait(name string, slots, running int, wait time.Duration) (*jobs.Job, error) {
+	ctrPolls.Add(1)
 	deadline := time.Now().Add(wait)
 	for {
 		if running >= slots {
@@ -459,7 +473,9 @@ func (s *Store) refreshAgent(name string, slots, running int) error {
 	renewed := s.renewedAt[name]
 	s.mu.Unlock()
 
-	unchanged := wrote && last == [2]int{slots, running}
+	// Only a change in slots needs a write. The running count changes with every job, and
+	// writing it on each poll made the write load grow with the number of agents.
+	unchanged := wrote && last[0] == slots
 	// A lease kept alive within the last third of its TTL is still safe, so an unchanged agent
 	// does not need another round trip just to renew it.
 	if known && unchanged && time.Since(renewed) < s.LeaseTTL/3 {
@@ -469,6 +485,7 @@ func (s *Store) refreshAgent(name string, slots, running int) error {
 	ctx, cancel := ctxTimeout()
 	defer cancel()
 	if known {
+		ctrKeepAlive.Add(1)
 		if _, err := s.cli.KeepAliveOnce(ctx, id); err != nil {
 			known = false
 		} else {
@@ -570,6 +587,8 @@ func (s *Store) requeueOrphans() error {
 // claimOldest hands the oldest queued job to an agent. It tries a few candidates in case
 // another agent takes one first.
 func (s *Store) claimOldest(name string) (*jobs.Job, error) {
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
 	for attempt := 0; attempt < 20; attempt++ {
 		ctx, cancel := ctxTimeout()
 		resp, err := s.cli.Get(ctx, s.queuePrefix(), clientv3.WithPrefix(), clientv3.WithLimit(1))
@@ -673,6 +692,7 @@ func (s *Store) updateJob(
 		ops = append(ops, clientv3.OpPut(s.jobKey(seq), string(raw)))
 
 		ctx, cancel = ctxTimeout()
+		ctrUpdateTxn.Add(1)
 		txn, err := s.cli.Txn(ctx).If(cmps...).Then(ops...).Commit()
 		cancel()
 		if err != nil {
@@ -681,6 +701,7 @@ func (s *Store) updateJob(
 		if txn.Succeeded {
 			return j, nil
 		}
+		ctrUpdateFail.Add(1)
 		// Something changed under us. Read again and retry.
 	}
 	return jobs.Job{}, fmt.Errorf("job %s: too much contention", jobID(seq))
@@ -813,7 +834,8 @@ func (s *Store) Metrics() (string, error) {
 		}
 		counts[j.Status]++
 	}
-	var online, slots, busy int
+	var online, slots int
+	busy := counts[jobs.Assigned] // a job is assigned exactly while it holds a slot
 	for _, kv := range agentResp.Kvs {
 		var a agentInfo
 		if err := json.Unmarshal(kv.Value, &a); err != nil {
@@ -821,7 +843,7 @@ func (s *Store) Metrics() (string, error) {
 		}
 		online++
 		slots += a.Slots
-		busy += a.Running
+		_ = a
 	}
 
 	var b strings.Builder
@@ -835,5 +857,7 @@ func (s *Store) Metrics() (string, error) {
 	fmt.Fprintf(&b, "minibox_agent_slots %d\n", slots)
 	b.WriteString("# HELP minibox_agent_slots_busy Slots currently running a job.\n# TYPE minibox_agent_slots_busy gauge\n")
 	fmt.Fprintf(&b, "minibox_agent_slots_busy %d\n", busy)
+	fmt.Fprintf(&b, "minibox_debug_polls_total %d\nminibox_debug_keepalives_total %d\nminibox_debug_update_txns_total %d\nminibox_debug_update_txns_lost_total %d\n",
+		ctrPolls.Load(), ctrKeepAlive.Load(), ctrUpdateTxn.Load(), ctrUpdateFail.Load())
 	return b.String(), nil
 }

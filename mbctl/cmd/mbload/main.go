@@ -48,6 +48,9 @@ func main() {
 	var (
 		mu        sync.Mutex
 		submitted = map[string]time.Time{}
+		// early holds finish times for jobs reported before their submit recorded its start.
+		// Without this, such a job would count as finished but get no latency.
+		early     = map[string]time.Time{}
 		latencies []time.Duration
 		finished  atomic.Int64
 		errs      atomic.Int64
@@ -72,6 +75,11 @@ func main() {
 				}
 				mu.Lock()
 				submitted[id] = start
+				if fin, ok := early[id]; ok {
+					latencies = append(latencies, fin.Sub(start))
+					lastFin = fin
+					delete(early, id)
+				}
 				if firstSub.IsZero() || start.Before(firstSub) {
 					firstSub = start
 				}
@@ -113,6 +121,8 @@ func main() {
 				if t, ok := submitted[id]; ok {
 					latencies = append(latencies, now.Sub(t))
 					lastFin = now
+				} else {
+					early[id] = now
 				}
 				mu.Unlock()
 				finished.Add(1)
